@@ -1,0 +1,23 @@
+[general]
+name=Advanced Raster Processor
+qgisMinimumVersion=3.40
+description=High-performance tool for point cloud interpolation, raster resampling, and smoothing. Optimized for large files (100+ GB).
+version=1.0
+author=Benedikt Haimerl
+email=benedikt.haimerl@uni-hamburg.de
+
+about=This plugin provides three main functions:
+    1. Point Cloud Interpolation - Convert point data to raster surfaces
+    2. Raster Resampling - Change raster resolution efficiently
+    3. Raster Smoothing - Apply smoothing filters to reduce noise
+    
+    Optimized for very large datasets with tile-based processing.
+
+tags=raster,interpolation,point cloud,DEM,processing,smoothing,resample
+
+category=Raster
+
+icon=Sonnenschein.ico
+
+experimental=True
+deprecated=False
