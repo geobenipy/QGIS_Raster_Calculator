@@ -28,7 +28,8 @@ The plugin is optimized for files up to 100+ GB and uses minimal RAM.
 1. Get Windows
 
 ### Step 2: Create the plugin folder
-- Copy raster_processor foder onto Plugins Folder
+- Download all files and put dem into a folder called raster_processor
+- Copy raster_processor folder onto Plugins Folder
 
 ### Step 3: Install required Python packages
 
@@ -293,3 +294,4 @@ If you have issues:
 This plugin is open source. Feel free to modify and share.
 
 ---
+
