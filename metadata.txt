@@ -15,6 +15,6 @@ about=This plugin provides three main functions:
 
 tags=raster,interpolation,point cloud,DEM,processing,smoothing,resample
 category=Raster
-icon=Sonnenschein.ico
+icon=icon.ico
 experimental=True
 deprecated=False

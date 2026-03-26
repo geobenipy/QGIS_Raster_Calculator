@@ -1,38 +1,37 @@
 """
 QGIS Plugin: Raster Processor
-Full version with logging, XYZ file support, raster resampling,
-smoothing, and optional extrapolation control.
-Requirements:
-- QGIS
-- NumPy
-- SciPy
-- GDAL
+Full version with:
+- Interpolation (IDW, Linear, Cubic, Nearest, RBF)
+- Resample (Bilinear, Cubic, Nearest, Average, Lanczos)
+- Smooth (Gaussian, Uniform)
+- Correct coordinate orientation (no flip)
+- Progress bar updates
+- Output added automatically to QGIS project
 """
 
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QVariant, QCoreApplication
 from qgis.PyQt.QtWidgets import (
     QAction, QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
-    QDoubleSpinBox, QProgressBar, QFileDialog, QGroupBox, QRadioButton, QCheckBox,
-    QTextEdit, QLineEdit, QMessageBox
+    QDoubleSpinBox, QSpinBox, QProgressBar, QFileDialog, QGroupBox, QRadioButton,
+    QCheckBox, QTextEdit, QLineEdit
 )
 from qgis.core import QgsVectorLayer, QgsRasterLayer, QgsProject, QgsMessageLog, Qgis
+
 from scipy.interpolate import griddata, RBFInterpolator
 from scipy.ndimage import gaussian_filter, uniform_filter
 from scipy.spatial import cKDTree, Delaunay
 from osgeo import gdal, osr
+
 import numpy as np
 import os
 import re
-import csv
 
 PLUGIN_TAG = "RasterProcessor"
 NODATA_VALUE = -9999.0
 
-
 class RasterProcessorPlugin:
     def __init__(self, iface):
         self.iface = iface
-        self.plugin_dir = os.path.dirname(__file__)
         self.action = None
 
     def initGui(self):
@@ -42,7 +41,7 @@ class RasterProcessorPlugin:
         self.iface.addPluginToMenu("&Raster Processor", self.action)
 
     def unload(self):
-        if self.action is not None:
+        if self.action:
             self.iface.removePluginMenu("&Raster Processor", self.action)
             self.iface.removeToolBarIcon(self.action)
 
@@ -60,19 +59,21 @@ class RasterProcessorDialog(QDialog):
         self.setMinimumHeight(700)
         self.xyz_file_path = ""
         self.raster_file_path = ""
-        self.smooth_raster_path = ""
+        self.smooth_raster_file_path = ""
         self.setup_ui()
         self.refresh_layers()
 
+    # -----------------------------
+    # UI / logging
+    # -----------------------------
     def setup_ui(self):
         layout = QVBoxLayout()
-
         # Mode selection
-        mode_group = QGroupBox("Processing Mode")
+        mode_group = QGroupBox("Processing")
         mode_layout = QVBoxLayout()
-        self.interpolate_radio = QRadioButton("Interpolate XYZ / Point Cloud")
-        self.resample_radio = QRadioButton("Resample Raster")
-        self.smooth_radio = QRadioButton("Smooth Raster")
+        self.interpolate_radio = QRadioButton("Interpolate point cloud / XYZ file")
+        self.resample_radio = QRadioButton("Resample raster")
+        self.smooth_radio = QRadioButton("Smooth raster")
         self.interpolate_radio.setChecked(True)
         mode_layout.addWidget(self.interpolate_radio)
         mode_layout.addWidget(self.resample_radio)
@@ -80,16 +81,15 @@ class RasterProcessorDialog(QDialog):
         mode_group.setLayout(mode_layout)
         layout.addWidget(mode_group)
 
-        # Interpolation settings
-        self.interp_group = QGroupBox("Interpolation Settings")
+        # Interpolation group
+        self.interp_group = QGroupBox("Interpolation settings")
         interp_layout = QVBoxLayout()
         self.extrap_check = QCheckBox("Allow extrapolation")
         self.extrap_check.setChecked(False)
         interp_layout.addWidget(self.extrap_check)
 
-        # Vector layer selection
         vector_layout = QHBoxLayout()
-        vector_layout.addWidget(QLabel("Point Layer:"))
+        vector_layout.addWidget(QLabel("Point layer:"))
         self.vector_combo = QComboBox()
         vector_layout.addWidget(self.vector_combo)
         self.refresh_btn = QPushButton("Refresh")
@@ -97,9 +97,8 @@ class RasterProcessorDialog(QDialog):
         vector_layout.addWidget(self.refresh_btn)
         interp_layout.addLayout(vector_layout)
 
-        # XYZ file selection
         xyz_layout = QHBoxLayout()
-        xyz_layout.addWidget(QLabel("XYZ file (.txt/.csv/.xyz):"))
+        xyz_layout.addWidget(QLabel("XYZ file (.txt/.dat/.csv/.xyz):"))
         self.xyz_path_edit = QLineEdit()
         self.xyz_path_edit.setReadOnly(True)
         xyz_layout.addWidget(self.xyz_path_edit)
@@ -108,14 +107,12 @@ class RasterProcessorDialog(QDialog):
         xyz_layout.addWidget(self.xyz_btn)
         interp_layout.addLayout(xyz_layout)
 
-        # Z-value field
         field_layout = QHBoxLayout()
         field_layout.addWidget(QLabel("Z-value field:"))
         self.field_combo = QComboBox()
         field_layout.addWidget(self.field_combo)
         interp_layout.addLayout(field_layout)
 
-        # Method selection
         method_layout = QHBoxLayout()
         method_layout.addWidget(QLabel("Method:"))
         self.method_combo = QComboBox()
@@ -123,11 +120,10 @@ class RasterProcessorDialog(QDialog):
         method_layout.addWidget(self.method_combo)
         interp_layout.addLayout(method_layout)
 
-        # Resolution
         res_layout = QHBoxLayout()
         res_layout.addWidget(QLabel("Resolution (map units per pixel):"))
         self.resolution_spin = QDoubleSpinBox()
-        self.resolution_spin.setRange(0.0001, 1e6)
+        self.resolution_spin.setRange(0.0001, 1000000)
         self.resolution_spin.setValue(1.0)
         self.resolution_spin.setDecimals(4)
         res_layout.addWidget(self.resolution_spin)
@@ -137,26 +133,16 @@ class RasterProcessorDialog(QDialog):
         layout.addWidget(self.interp_group)
 
         # Resample group
-        self.resample_group = QGroupBox("Resample Settings")
+        self.resample_group = QGroupBox("Resample settings")
         resample_layout = QVBoxLayout()
         raster_layout = QHBoxLayout()
-        raster_layout.addWidget(QLabel("Raster Layer:"))
+        raster_layout.addWidget(QLabel("Raster layer:"))
         self.raster_combo = QComboBox()
         raster_layout.addWidget(self.raster_combo)
         self.raster_refresh_btn = QPushButton("Refresh")
         self.raster_refresh_btn.clicked.connect(self.refresh_layers)
         raster_layout.addWidget(self.raster_refresh_btn)
         resample_layout.addLayout(raster_layout)
-
-        raster_file_layout = QHBoxLayout()
-        raster_file_layout.addWidget(QLabel("Or raster file:"))
-        self.raster_path_edit = QLineEdit()
-        self.raster_path_edit.setReadOnly(True)
-        raster_file_layout.addWidget(self.raster_path_edit)
-        self.raster_btn = QPushButton("Browse")
-        self.raster_btn.clicked.connect(self.select_raster_file)
-        raster_file_layout.addWidget(self.raster_btn)
-        resample_layout.addLayout(raster_file_layout)
 
         factor_layout = QHBoxLayout()
         factor_layout.addWidget(QLabel("Scale factor:"))
@@ -173,32 +159,21 @@ class RasterProcessorDialog(QDialog):
         self.resample_method_combo.addItems(["Bilinear", "Cubic", "Nearest", "Average", "Lanczos"])
         resample_method_layout.addWidget(self.resample_method_combo)
         resample_layout.addLayout(resample_method_layout)
-
         self.resample_group.setLayout(resample_layout)
         self.resample_group.setVisible(False)
         layout.addWidget(self.resample_group)
 
         # Smooth group
-        self.smooth_group = QGroupBox("Smooth Settings")
+        self.smooth_group = QGroupBox("Smooth settings")
         smooth_layout = QVBoxLayout()
         smooth_raster_layout = QHBoxLayout()
-        smooth_raster_layout.addWidget(QLabel("Raster Layer:"))
+        smooth_raster_layout.addWidget(QLabel("Raster layer:"))
         self.smooth_raster_combo = QComboBox()
         smooth_raster_layout.addWidget(self.smooth_raster_combo)
         self.smooth_raster_refresh_btn = QPushButton("Refresh")
         self.smooth_raster_refresh_btn.clicked.connect(self.refresh_layers)
         smooth_raster_layout.addWidget(self.smooth_raster_refresh_btn)
         smooth_layout.addLayout(smooth_raster_layout)
-
-        smooth_file_layout = QHBoxLayout()
-        smooth_file_layout.addWidget(QLabel("Or raster file:"))
-        self.smooth_raster_path_edit = QLineEdit()
-        self.smooth_raster_path_edit.setReadOnly(True)
-        smooth_file_layout.addWidget(self.smooth_raster_path_edit)
-        self.smooth_raster_btn = QPushButton("Browse")
-        self.smooth_raster_btn.clicked.connect(self.select_smooth_raster_file)
-        smooth_file_layout.addWidget(self.smooth_raster_btn)
-        smooth_layout.addLayout(smooth_file_layout)
 
         smooth_factor_layout = QHBoxLayout()
         smooth_factor_layout.addWidget(QLabel("Smooth factor:"))
@@ -215,12 +190,11 @@ class RasterProcessorDialog(QDialog):
         self.smooth_method_combo.addItems(["Gaussian", "Uniform (Mean)"])
         smooth_method_layout.addWidget(self.smooth_method_combo)
         smooth_layout.addLayout(smooth_method_layout)
-
         self.smooth_group.setLayout(smooth_layout)
         self.smooth_group.setVisible(False)
         layout.addWidget(self.smooth_group)
 
-        # Output selection
+        # Output
         output_layout = QHBoxLayout()
         output_layout.addWidget(QLabel("Output:"))
         self.output_path = QLabel("Not set")
@@ -230,12 +204,10 @@ class RasterProcessorDialog(QDialog):
         output_layout.addWidget(self.output_btn)
         layout.addLayout(output_layout)
 
-        # Progress
+        # Progress & buttons
         self.progress = QProgressBar()
         self.progress.setValue(0)
         layout.addWidget(self.progress)
-
-        # Buttons
         button_layout = QHBoxLayout()
         self.run_btn = QPushButton("Process")
         self.run_btn.clicked.connect(self.process)
@@ -245,7 +217,7 @@ class RasterProcessorDialog(QDialog):
         button_layout.addWidget(self.close_btn)
         layout.addLayout(button_layout)
 
-        # Log window
+        # Log
         layout.addWidget(QLabel("Log:"))
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
@@ -254,7 +226,7 @@ class RasterProcessorDialog(QDialog):
 
         self.setLayout(layout)
 
-        # Connect radio toggles
+        # Connections
         self.interpolate_radio.toggled.connect(self.toggle_mode)
         self.resample_radio.toggled.connect(self.toggle_mode)
         self.smooth_radio.toggled.connect(self.toggle_mode)
@@ -263,7 +235,6 @@ class RasterProcessorDialog(QDialog):
     def log(self, message, level=Qgis.Info):
         QgsMessageLog.logMessage(str(message), PLUGIN_TAG, level)
         self.log_text.append(str(message))
-        self.iface.messageBar().pushMessage(PLUGIN_TAG, str(message), level, 3)
 
     def toggle_mode(self):
         self.interp_group.setVisible(self.interpolate_radio.isChecked())
@@ -271,302 +242,222 @@ class RasterProcessorDialog(QDialog):
         self.smooth_group.setVisible(self.smooth_radio.isChecked())
 
     # -----------------------------
-    # Layer / file helpers
+    # File selection / layers
     # -----------------------------
     def refresh_layers(self):
-        self.populate_vector_layers()
-        self.populate_raster_layers()
-        self.populate_smooth_layers()
-        self.log("Layer lists refreshed.")
-
-    def populate_vector_layers(self):
         self.vector_combo.clear()
-        for layer in QgsProject.instance().mapLayers().values():
+        self.raster_combo.clear()
+        self.smooth_raster_combo.clear()
+        layers = QgsProject.instance().mapLayers().values()
+        for layer in layers:
             if isinstance(layer, QgsVectorLayer):
                 self.vector_combo.addItem(layer.name(), layer)
-        self.update_fields()
-
-    def populate_raster_layers(self):
-        self.raster_combo.clear()
-        for layer in QgsProject.instance().mapLayers().values():
             if isinstance(layer, QgsRasterLayer):
                 self.raster_combo.addItem(layer.name(), layer)
-
-    def populate_smooth_layers(self):
-        self.smooth_raster_combo.clear()
-        for layer in QgsProject.instance().mapLayers().values():
-            if isinstance(layer, QgsRasterLayer):
                 self.smooth_raster_combo.addItem(layer.name(), layer)
+        self.update_fields()
+        self.log("Layer lists refreshed.")
 
     def update_fields(self):
         self.field_combo.clear()
         layer = self.vector_combo.currentData()
-        if not layer:
-            return
-        for field in layer.fields():
-            if field.type() in (QVariant.Int, QVariant.Double, QVariant.LongLong, QVariant.UInt, QVariant.ULongLong):
-                self.field_combo.addItem(field.name())
-        if self.field_combo.count() == 0:
+        if layer:
             for field in layer.fields():
-                self.field_combo.addItem(field.name())
+                if field.type() in (QVariant.Int, QVariant.Double, QVariant.LongLong, QVariant.UInt, QVariant.ULongLong):
+                    self.field_combo.addItem(field.name())
 
     def select_output(self):
         filename, _ = QFileDialog.getSaveFileName(self, "Output raster", "", "GeoTIFF (*.tif)")
+        if filename and not filename.lower().endswith(".tif"):
+            filename += ".tif"
         if filename:
-            if not filename.lower().endswith(".tif"):
-                filename += ".tif"
             self.output_path.setText(filename)
 
     def select_xyz_file(self):
-        filename, _ = QFileDialog.getOpenFileName(self, "Select XYZ file", "", "XYZ/Text/CSV (*.txt *.csv *.xyz);;All files (*)")
+        filename, _ = QFileDialog.getOpenFileName(self, "Select XYZ file", "", "XYZ/Text/CSV (*.txt *.dat *.xyz *.csv)")
         if filename:
             self.xyz_file_path = filename
             self.xyz_path_edit.setText(filename)
-            self.log(f"Selected XYZ file: {filename}")
-
-    def select_raster_file(self):
-        filename, _ = QFileDialog.getOpenFileName(self, "Select raster file", "", "Raster files (*.tif *.tiff *.img *.asc *.grd);;All files (*)")
-        if filename:
-            self.raster_file_path = filename
-            self.raster_path_edit.setText(filename)
-            self.log(f"Selected raster file: {filename}")
-
-    def select_smooth_raster_file(self):
-        filename, _ = QFileDialog.getOpenFileName(self, "Select raster file", "", "Raster files (*.tif *.tiff *.img *.asc *.grd);;All files (*)")
-        if filename:
-            self.smooth_raster_path = filename
-            self.smooth_raster_path_edit.setText(filename)
-            self.log(f"Selected raster for smoothing: {filename}")
+            self.log(f"XYZ file selected: {filename}")
 
     # -----------------------------
-    # Main process
+    # Processing
     # -----------------------------
+    def _selected_output(self):
+        output = self.output_path.text()
+        if not output or output == "Not set":
+            raise ValueError("Please select an output file.")
+        return output
+
+    def _load_points_from_vector(self, layer, field_name):
+        xs, ys, zs = [], [], []
+        total = layer.featureCount()
+        for i, feat in enumerate(layer.getFeatures()):
+            geom = feat.geometry()
+            if geom is None or geom.isEmpty():
+                continue
+            try:
+                z = float(feat[field_name])
+            except:
+                continue
+            pts = geom.asMultiPoint() if geom.isMultipart() else [geom.asPoint()]
+            for pt in pts:
+                xs.append(pt.x())
+                ys.append(pt.y())
+                zs.append(z)
+            if total > 0 and i % 100 == 0:
+                self.progress.setValue(int((i/total)*100))
+                QCoreApplication.processEvents()
+        self.progress.setValue(100)
+        return np.array(xs), np.array(ys), np.array(zs)
+
+    def _read_xyz_file(self, filepath):
+        data = np.loadtxt(filepath, comments="#")
+        return data[:,0], data[:,1], data[:,2]
+
     def process(self):
         try:
-            output = self.output_path.text()
-            if not output or output == "Not set":
-                raise ValueError("Please select an output file.")
-
-            self.run_btn.setEnabled(False)
-            self.progress.setValue(0)
-
+            output_file = self._selected_output()
             if self.interpolate_radio.isChecked():
-                self.process_interpolation(output)
+                self._process_interpolation(output_file)
             elif self.resample_radio.isChecked():
-                self.process_resample(output)
-            else:
-                self.process_smooth(output)
-
-            self.progress.setValue(100)
-            self.log(f"Processing completed: {output}")
-
-            # Load output into QGIS
-            layer = QgsRasterLayer(output, os.path.basename(output))
-            if layer.isValid():
-                QgsProject.instance().addMapLayer(layer)
-                self.log("Output added to project.")
-            else:
-                self.log("Output created but could not be loaded.", Qgis.Warning)
-
+                self._process_resample(output_file)
+            elif self.smooth_radio.isChecked():
+                self._process_smooth(output_file)
+            self.log("Processing finished successfully.", Qgis.Success)
         except Exception as e:
             self.log(f"Error: {e}", Qgis.Critical)
-            QMessageBox.critical(self, "Raster Processor", str(e))
-        finally:
-            self.run_btn.setEnabled(True)
 
     # -----------------------------
     # Interpolation
     # -----------------------------
-    def process_interpolation(self, output_path):
-        """Interpolates XYZ or vector points to raster with optional extrapolation."""
-        # --- Load points ---
-        points = []
-        values = []
+    def _process_interpolation(self, output_file):
+        resolution = self.resolution_spin.value()
+        allow_extrap = self.extrap_check.isChecked()
 
-        layer = self.vector_combo.currentData()
-        z_field = self.field_combo.currentText()
-        if layer:
-            for feat in layer.getFeatures():
-                geom = feat.geometry()
-                if geom.isEmpty():
-                    continue
-                if geom.isMultipart():
-                    pts = geom.asMultiPoint()
-                else:
-                    pts = [geom.asPoint()]
-                for pt in pts:
-                    val = feat[z_field]
-                    if val is None or val == NODATA_VALUE:
-                        continue
-                    points.append([pt.x(), pt.y()])
-                    values.append(val)
-        elif self.xyz_file_path:
-            with open(self.xyz_file_path, "r") as f:
-                for line in f:
-                    toks = re.split(r"[\s,;]+", line.strip())
-                    if len(toks) < 3:
-                        continue
-                    try:
-                        x, y, z = map(float, toks[:3])
-                        if z != NODATA_VALUE:
-                            points.append([x, y])
-                            values.append(z)
-                    except:
-                        continue
+        if self.xyz_file_path:
+            x, y, z = self._read_xyz_file(self.xyz_file_path)
+            crs = osr.SpatialReference()
+            crs.ImportFromEPSG(4326)
         else:
-            raise ValueError("No input points selected.")
+            layer = self.vector_combo.currentData()
+            field_name = self.field_combo.currentText()
+            x, y, z = self._load_points_from_vector(layer, field_name)
+            crs = osr.SpatialReference()
+            crs.ImportFromWkt(layer.crs().toWkt())
 
-        points = np.array(points)
-        values = np.array(values, dtype=np.float32)
-        if len(points) < 3:
-            raise ValueError("Not enough points for interpolation.")
+        xmin, xmax = x.min(), x.max()
+        ymin, ymax = y.min(), y.max()
+        cols = int(np.ceil((xmax - xmin)/resolution))+1
+        rows = int(np.ceil((ymax - ymin)/resolution))+1
 
-        # --- Create grid ---
-        resolution = float(self.resolution_spin.value())
-        xmin, ymin = points.min(axis=0)
-        xmax, ymax = points.max(axis=0)
-        xi = np.arange(xmin, xmax + resolution, resolution)
-        yi = np.arange(ymin, ymax + resolution, resolution)
-        grid_x, grid_y = np.meshgrid(xi, yi)
+        grid_x = np.linspace(xmin, xmax, cols)
+        grid_y = np.linspace(ymin, ymax, rows)
+        grid_X, grid_Y = np.meshgrid(grid_x, grid_y)
 
-        self.log(f"Grid size: {grid_x.shape[1]} x {grid_x.shape[0]} pixels")
-
-        # --- Interpolation ---
         method = self.method_combo.currentText().lower()
-        extrapolate = self.extrap_check.isChecked()
-        grid_z = np.full_like(grid_x, NODATA_VALUE, dtype=np.float32)
-
-        if method == "idw":
-            k = min(8, len(points))
-            tree = cKDTree(points)
-            xi_flat = np.c_[grid_x.ravel(), grid_y.ravel()]
-            dists, idx = tree.query(xi_flat, k=k)
-            dists[dists == 0] = 1e-12
-            weights = 1.0 / (dists ** 2)
-            vals = np.take(values, idx)
-            zi_flat = np.sum(weights * vals, axis=1) / np.sum(weights, axis=1)
-            if not extrapolate:
-                hull = Delaunay(points)
-                mask = hull.find_simplex(xi_flat) < 0
-                zi_flat[mask] = NODATA_VALUE
-            grid_z = zi_flat.reshape(grid_x.shape)
-
-        elif method in ["linear", "cubic", "nearest"]:
-            zi = griddata(points, values, (grid_x, grid_y), method=method, fill_value=NODATA_VALUE)
-            grid_z = zi.astype(np.float32)
-            if not extrapolate:
-                hull = Delaunay(points)
-                mask = hull.find_simplex(np.c_[grid_x.ravel(), grid_y.ravel()]) < 0
-                grid_z.ravel()[mask] = NODATA_VALUE
-
-        elif method == "rbf":
-            rbf = RBFInterpolator(points, values, neighbors=15, smoothing=0.0)
-            zi_flat = rbf(np.c_[grid_x.ravel(), grid_y.ravel()])
-            grid_z = zi_flat.reshape(grid_x.shape).astype(np.float32)
-            if not extrapolate:
-                hull = Delaunay(points)
-                mask = hull.find_simplex(np.c_[grid_x.ravel(), grid_y.ravel()]) < 0
-                grid_z.ravel()[mask] = NODATA_VALUE
-
+        points = np.column_stack([x, y])
+        if not allow_extrap:
+            hull = Delaunay(points)
+            mask = hull.find_simplex(np.column_stack([grid_X.ravel(), grid_Y.ravel()]))>=0
         else:
-            raise ValueError(f"Unknown interpolation method: {method}")
+            mask = np.ones(grid_X.size, dtype=bool)
 
-        # --- Save raster ---
-        self.save_raster(output_path, grid_z, xmin, ymax, resolution)
+        if method=="idw":
+            xi, yi = grid_X.ravel(), grid_Y.ravel()
+            tree = cKDTree(points)
+            k = min(12,len(x))
+            dists, idxs = tree.query(np.column_stack([xi, yi]), k=k)
+            weights = 1/(dists+1e-12)
+            zi = np.sum(weights*z[idxs], axis=1)/np.sum(weights,axis=1)
+        elif method in ("linear","nearest","cubic"):
+            zi = griddata(points,z,(grid_X,grid_Y),method=method).ravel()
+        elif method=="rbf":
+            rbf = RBFInterpolator(points,z)
+            zi = rbf(np.column_stack([grid_X.ravel(), grid_Y.ravel()]))
+        else:
+            raise ValueError(f"Unknown method {method}")
+
+        zi[~mask] = NODATA_VALUE
+        zi = zi.reshape((rows,cols))
+
+        driver = gdal.GetDriverByName("GTiff")
+        out_ds = driver.Create(output_file,cols,rows,1,gdal.GDT_Float32, options=["COMPRESS=LZW"])
+        out_ds.SetGeoTransform((xmin,resolution,0,ymax,0,-resolution))
+        out_ds.SetProjection(crs.ExportToWkt())
+        band = out_ds.GetRasterBand(1)
+        band.SetNoDataValue(NODATA_VALUE)
+        band.WriteArray(zi)
+        out_ds.FlushCache()
+
+        rlayer = QgsRasterLayer(output_file, os.path.basename(output_file))
+        if rlayer.isValid():
+            QgsProject.instance().addMapLayer(rlayer)
+            self.log("Raster added to QGIS project.")
 
     # -----------------------------
     # Resample
     # -----------------------------
-    def process_resample(self, output_path):
-        """Resamples raster by scale factor."""
+    def _process_resample(self, output_file):
+        factor = self.resample_factor_spin.value()
+        method_map = {
+            "bilinear": gdal.GRA_Bilinear,
+            "cubic": gdal.GRA_Cubic,
+            "nearest": gdal.GRA_NearestNeighbour,
+            "average": gdal.GRA_Average,
+            "lanczos": gdal.GRA_Lanczos
+        }
+        method_name = self.resample_method_combo.currentText().lower()
+        resample_method = method_map.get(method_name, gdal.GRA_Bilinear)
+        ds = None
         layer = self.raster_combo.currentData()
-        raster_file = self.raster_file_path if self.raster_file_path else None
         if layer:
-            src = gdal.Open(layer.source())
-        elif raster_file:
-            src = gdal.Open(raster_file)
-        else:
-            raise ValueError("No raster selected for resampling.")
+            ds = gdal.Open(layer.source())
+        if ds is None:
+            raise ValueError("No raster to resample.")
 
-        factor = float(self.resample_factor_spin.value())
-        method = self.resample_method_combo.currentText().lower()
-
-        # Map method to GDAL
-        method_map = {"nearest": gdal.GRA_NearestNeighbour,
-                      "bilinear": gdal.GRA_Bilinear,
-                      "cubic": gdal.GRA_Cubic,
-                      "average": gdal.GRA_Average,
-                      "lanczos": gdal.GRA_Lanczos}
-        resample_alg = method_map.get(method, gdal.GRA_Bilinear)
-
-        src_band = src.GetRasterBand(1)
-        xsize = int(src.RasterXSize * factor)
-        ysize = int(src.RasterYSize * factor)
-
-        geotransform = list(src.GetGeoTransform())
-        geotransform[1] /= factor
-        geotransform[5] /= factor
-
+        cols, rows = int(ds.RasterXSize*factor), int(ds.RasterYSize*factor)
         driver = gdal.GetDriverByName("GTiff")
-        dst = driver.Create(output_path, xsize, ysize, 1, gdal.GDT_Float32)
-        dst.SetGeoTransform(geotransform)
-        dst.SetProjection(src.GetProjection())
-
-        gdal.ReprojectImage(src, dst, src.GetProjection(), src.GetProjection(), resample_alg)
-        dst = None
-        src = None
-        self.log(f"Resampled raster saved: {output_path}")
+        out_ds = driver.Create(output_file,cols,rows,ds.RasterCount,gdal.GDT_Float32, options=["COMPRESS=LZW"])
+        gt = ds.GetGeoTransform()
+        out_ds.SetGeoTransform((gt[0], gt[1]/factor, 0, gt[3], 0, gt[5]/factor))
+        out_ds.SetProjection(ds.GetProjection())
+        for i in range(ds.RasterCount):
+            gdal.ReprojectImage(ds,out_ds,ds.GetProjection(),ds.GetProjection(),resample_method)
+        out_ds.FlushCache()
+        rlayer = QgsRasterLayer(output_file, os.path.basename(output_file))
+        if rlayer.isValid():
+            QgsProject.instance().addMapLayer(rlayer)
+            self.log("Resampled raster added to QGIS project.")
 
     # -----------------------------
-    # Smoothing
+    # Smooth
     # -----------------------------
-    def process_smooth(self, output_path):
-        """Smooth raster using Gaussian or Uniform filter."""
+    def _process_smooth(self, output_file):
+        factor = self.smooth_factor_spin.value()
+        method_name = self.smooth_method_combo.currentText().lower()
+        ds = None
         layer = self.smooth_raster_combo.currentData()
-        raster_file = self.smooth_raster_path if self.smooth_raster_path else None
         if layer:
-            src = gdal.Open(layer.source())
-        elif raster_file:
-            src = gdal.Open(raster_file)
+            ds = gdal.Open(layer.source())
+        if ds is None:
+            raise ValueError("No raster to smooth.")
+
+        arr = ds.GetRasterBand(1).ReadAsArray()
+        if method_name=="gaussian":
+            arr_smooth = gaussian_filter(arr, sigma=factor)
         else:
-            raise ValueError("No raster selected for smoothing.")
+            arr_smooth = uniform_filter(arr, size=factor)
 
-        method = self.smooth_method_combo.currentText()
-        factor = float(self.smooth_factor_spin.value())
-        band = src.GetRasterBand(1)
-        arr = band.ReadAsArray().astype(np.float32)
-
-        if method == "Gaussian":
-            smooth_arr = gaussian_filter(arr, sigma=factor)
-        else:
-            smooth_arr = uniform_filter(arr, size=int(factor))
-
-        geotransform = src.GetGeoTransform()
-        proj = src.GetProjection()
         driver = gdal.GetDriverByName("GTiff")
-        dst = driver.Create(output_path, src.RasterXSize, src.RasterYSize, 1, gdal.GDT_Float32)
-        dst.SetGeoTransform(geotransform)
-        dst.SetProjection(proj)
-        dst.GetRasterBand(1).WriteArray(smooth_arr)
-        dst.GetRasterBand(1).SetNoDataValue(NODATA_VALUE)
-        dst = None
-        src = None
-        self.log(f"Smoothed raster saved: {output_path}")
+        out_ds = driver.Create(output_file, ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Float32, options=["COMPRESS=LZW"])
+        out_ds.SetGeoTransform(ds.GetGeoTransform())
+        out_ds.SetProjection(ds.GetProjection())
+        out_ds.GetRasterBand(1).WriteArray(arr_smooth)
+        out_ds.GetRasterBand(1).SetNoDataValue(NODATA_VALUE)
+        out_ds.FlushCache()
 
-    # -----------------------------
-    # Utility
-    # -----------------------------
-    def save_raster(self, path, array, xmin, ymax, resolution):
-        nrows, ncols = array.shape
-        geotransform = (xmin, resolution, 0, ymax, 0, -resolution)
-        driver = gdal.GetDriverByName("GTiff")
-        out_raster = driver.Create(path, ncols, nrows, 1, gdal.GDT_Float32)
-        out_raster.SetGeoTransform(geotransform)
-        srs = osr.SpatialReference()
-        srs.ImportFromEPSG(4326)
-        out_raster.SetProjection(srs.ExportToWkt())
-        outband = out_raster.GetRasterBand(1)
-        outband.WriteArray(array)
-        outband.SetNoDataValue(NODATA_VALUE)
-        outband.FlushCache()
-        out_raster = None
+        rlayer = QgsRasterLayer(output_file, os.path.basename(output_file))
+        if rlayer.isValid():
+            QgsProject.instance().addMapLayer(rlayer)
+            self.log("Smoothed raster added to QGIS project.")
