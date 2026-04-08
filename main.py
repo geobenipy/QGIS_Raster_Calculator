@@ -909,6 +909,86 @@ class RasterProcessorDialog(QDialog):
         else:
             self.log("Output raster was written but could not be loaded into QGIS.", Qgis.Warning)
 
+    def _build_regular_grid_dataset(self, x, y, z, crs, grid_info):
+        cols = grid_info["unique_x"].size
+        rows = grid_info["unique_y"].size
+        array = np.full((rows, cols), DEFAULT_NODATA, dtype=np.float32)
+
+        x_index = np.searchsorted(grid_info["unique_x"], grid_info["rounded_x"])
+        y_index = np.searchsorted(grid_info["unique_y"], grid_info["rounded_y"])
+        row_index = rows - 1 - y_index
+        array[row_index, x_index] = np.asarray(z, dtype=np.float32)
+
+        dataset = gdal.GetDriverByName("MEM").Create("", cols, rows, 1, gdal.GDT_Float32)
+        dataset.SetProjection(crs.toWkt())
+        dataset.SetGeoTransform(
+            (
+                grid_info["unique_x"][0] - (grid_info["x_res"] / 2.0),
+                grid_info["x_res"],
+                0.0,
+                grid_info["unique_y"][-1] + (grid_info["y_res"] / 2.0),
+                0.0,
+                -grid_info["y_res"],
+            )
+        )
+        band = dataset.GetRasterBand(1)
+        band.SetNoDataValue(DEFAULT_NODATA)
+        band.WriteArray(array)
+        return dataset
+
+    def _process_regular_grid_input(self, output_file, x, y, z, crs, grid_info):
+        native_dataset = self._build_regular_grid_dataset(x, y, z, crs, grid_info)
+        native_bounds = (
+            grid_info["unique_x"][0] - (grid_info["x_res"] / 2.0),
+            grid_info["unique_y"][0] - (grid_info["y_res"] / 2.0),
+            grid_info["unique_x"][-1] + (grid_info["x_res"] / 2.0),
+            grid_info["unique_y"][-1] + (grid_info["y_res"] / 2.0),
+        )
+
+        self.log(
+            f"Regular grid detected: {grid_info['x_res']:.2f} x {grid_info['y_res']:.2f} m, "
+            f"completeness {grid_info['completeness'] * 100:.1f}%."
+        )
+
+        target_resolution = self.resolution_spin.value()
+        same_x = abs(target_resolution - grid_info["x_res"]) <= 1e-6
+        same_y = abs(target_resolution - grid_info["y_res"]) <= 1e-6
+
+        if same_x and same_y:
+            out_dataset = gdal.GetDriverByName("GTiff").CreateCopy(
+                output_file,
+                native_dataset,
+                options=self._gdal_creation_options(),
+            )
+        else:
+            rows, cols, _ = self._estimate_output_grid(
+                native_bounds[0],
+                native_bounds[1],
+                native_bounds[2],
+                native_bounds[3],
+                target_resolution,
+            )
+            self._validate_output_pixels(rows, cols, "Regular-grid export")
+            out_dataset = gdal.Warp(
+                output_file,
+                native_dataset,
+                options=gdal.WarpOptions(
+                    format="GTiff",
+                    xRes=target_resolution,
+                    yRes=target_resolution,
+                    resampleAlg=self.regular_grid_method_combo.currentText().lower(),
+                    srcNodata=DEFAULT_NODATA,
+                    dstNodata=DEFAULT_NODATA,
+                    multithread=True,
+                    creationOptions=self._gdal_creation_options(),
+                    callback=self._gdal_progress_callback,
+                ),
+            )
+
+        if out_dataset is None:
+            raise RuntimeError("Regular-grid export failed.")
+        out_dataset.FlushCache()
+
     def _gdal_progress_callback(self, completion, message, user_data):
         del message, user_data
         self._set_progress(completion * 100)
@@ -1070,6 +1150,24 @@ class RasterProcessorDialog(QDialog):
 
         self.log("Loading interpolation input points...")
         x, y, z, crs = self._collect_interpolation_points()
+        z = self._convert_vertical_values(z)
+
+        selected_mode = self._selected_grid_mode()
+        regular_grid = None
+        if selected_mode == "regular":
+            regular_grid = self._detect_regular_grid(x, y, min_completeness=0.0)
+            if regular_grid is None:
+                raise ValueError(
+                    "Regular-grid mode was selected, but the input does not look like a regular XY grid."
+                )
+        elif selected_mode == "auto":
+            regular_grid = self._detect_regular_grid(x, y)
+
+        if regular_grid is not None:
+            self._process_regular_grid_input(output_file, x, y, z, crs, regular_grid)
+            self._add_output_to_project(output_file)
+            return
+
         grid_spec = self._grid_spec_from_points(x, y, resolution)
         self.log(
             f"Interpolating {len(z):,} points to {grid_spec['cols']:,} x {grid_spec['rows']:,} pixels "
