@@ -392,7 +392,7 @@ class RasterProcessorDialog(QDialog):
         layout.addWidget(QLabel("Log:"))
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMinimumHeight(220)
+        self.log_text.setMinimumHeight(100)
         layout.addWidget(self.log_text)
 
         self.setLayout(layout)
