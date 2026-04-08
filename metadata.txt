@@ -1,20 +1,20 @@
 [general]
 name=Raster Processor
 qgisMinimumVersion=3.40
-description=High-performance tool for point cloud interpolation, raster resampling, and smoothing. Optimized for large files (100+ GB).
-version=1.1
+description=Memory-safe QGIS tool for point interpolation, raster resampling, and smoothing with meter-based settings.
+version=1.2
 author=Benedikt Haimerl
 email=benedikt.haimerl@uni-hamburg.de
 
 about=This plugin provides three main functions:
-    1. Point Cloud Interpolation - Convert point data to raster surfaces
-    2. Raster Resampling - Change raster resolution efficiently
-    3. Raster Smoothing - Apply smoothing filters to reduce noise
-    
-    Optimized for very large datasets with tile-based processing.
+    1. Point interpolation with robust tile-based processing for large outputs
+    2. Raster resampling using target resolution in meters
+    3. Raster smoothing using radius values in meters
+
+    Designed to avoid RAM spikes and guide the user with safer defaults.
 
 tags=raster,interpolation,point cloud,DEM,processing,smoothing,resample
 category=Raster
 icon=icon.ico
-experimental=True
+experimental=False
 deprecated=False
