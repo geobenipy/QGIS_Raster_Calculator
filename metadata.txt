@@ -2,7 +2,7 @@
 name=Raster Processor
 qgisMinimumVersion=3.40
 description=Memory-safe QGIS tool for point interpolation, raster resampling, and smoothing with meter-based settings.
-version=1.2
+version=1.4
 author=Benedikt Haimerl
 email=benedikt.haimerl@uni-hamburg.de
 

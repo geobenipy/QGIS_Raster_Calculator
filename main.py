@@ -3,13 +3,16 @@ QGIS Plugin: Raster Processor
 Memory-safe raster interpolation, resampling, and smoothing for QGIS.
 """
 
+from concurrent.futures import ProcessPoolExecutor
 from math import ceil
+import multiprocessing
 import os
 import re
+import sys
 
 import numpy as np
 from osgeo import gdal
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication, Qt, QVariant
 from qgis.PyQt.QtWidgets import (
     QAction,
     QCheckBox,
@@ -24,9 +27,11 @@ from qgis.PyQt.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSpinBox,
     QTextEdit,
     QVBoxLayout,
+    QWidget,
 )
 from qgis.core import (
     Qgis,
@@ -39,8 +44,9 @@ from qgis.core import (
 )
 from qgis.gui import QgsProjectionSelectionWidget
 from scipy.interpolate import RBFInterpolator, griddata
-from scipy.ndimage import gaussian_filter, uniform_filter
-from scipy.spatial import ConvexHull, QhullError, cKDTree
+from scipy.spatial import ConvexHull, QhullError
+
+from . import parallel_workers
 
 gdal.UseExceptions()
 
@@ -96,8 +102,9 @@ class RasterProcessorDialog(QDialog):
         super().__init__(parent)
         self.iface = iface
         self.setWindowTitle("Raster Processor")
-        self.setMinimumWidth(900)
-        self.setMinimumHeight(820)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
+        self.setMinimumSize(650, 500)
+        self.resize(900, 820)
         self.xyz_file_path = ""
         self.setup_ui()
         self.refresh_layers()
@@ -184,13 +191,23 @@ class RasterProcessorDialog(QDialog):
         interp_layout.addLayout(method_layout)
 
         res_layout = QHBoxLayout()
-        res_layout.addWidget(QLabel("Target resolution:"))
-        self.resolution_spin = QDoubleSpinBox()
-        self.resolution_spin.setRange(0.01, 1_000_000.0)
-        self.resolution_spin.setValue(1.0)
-        self.resolution_spin.setDecimals(2)
-        self.resolution_spin.setSuffix(" m/pixel")
-        res_layout.addWidget(self.resolution_spin)
+        res_layout.addWidget(QLabel("Grid cell size:"))
+        self.resolution_x_spin = QDoubleSpinBox()
+        self.resolution_x_spin.setRange(0.01, 1_000_000.0)
+        self.resolution_x_spin.setValue(1.0)
+        self.resolution_x_spin.setDecimals(2)
+        self.resolution_x_spin.setSuffix(" m")
+        res_layout.addWidget(self.resolution_x_spin)
+        res_layout.addWidget(QLabel("x"))
+        self.resolution_y_spin = QDoubleSpinBox()
+        self.resolution_y_spin.setRange(0.01, 1_000_000.0)
+        self.resolution_y_spin.setValue(1.0)
+        self.resolution_y_spin.setDecimals(2)
+        self.resolution_y_spin.setSuffix(" m")
+        res_layout.addWidget(self.resolution_y_spin)
+        self.link_resolution_check = QCheckBox("Link X/Y")
+        self.link_resolution_check.setChecked(True)
+        res_layout.addWidget(self.link_resolution_check)
         interp_layout.addLayout(res_layout)
 
         structure_layout = QHBoxLayout()
@@ -359,6 +376,32 @@ class RasterProcessorDialog(QDialog):
         self.smooth_group.setVisible(False)
         layout.addWidget(self.smooth_group)
 
+        performance_group = QGroupBox("Performance")
+        performance_layout = QVBoxLayout()
+
+        self.parallel_check = QCheckBox("Process large tile jobs in parallel (multiple CPU cores)")
+        self.parallel_check.setChecked(False)
+        performance_layout.addWidget(self.parallel_check)
+
+        worker_layout = QHBoxLayout()
+        worker_layout.addWidget(QLabel("Worker processes:"))
+        self.worker_count_spin = QSpinBox()
+        self.worker_count_spin.setRange(1, max(1, os.cpu_count() or 1))
+        self.worker_count_spin.setValue(max(1, (os.cpu_count() or 2) - 1))
+        self.worker_count_spin.setEnabled(False)
+        worker_layout.addWidget(self.worker_count_spin)
+        performance_layout.addLayout(worker_layout)
+
+        performance_hint_label = QLabel(
+            "Applies to tile-based IDW/Nearest interpolation and raster smoothing. Falls back "
+            "to a single process automatically if worker processes cannot be started."
+        )
+        performance_hint_label.setWordWrap(True)
+        performance_layout.addWidget(performance_hint_label)
+
+        performance_group.setLayout(performance_layout)
+        layout.addWidget(performance_group)
+
         output_layout = QHBoxLayout()
         output_layout.addWidget(QLabel("Output GeoTIFF:"))
         self.output_path_edit = QLineEdit()
@@ -377,9 +420,18 @@ class RasterProcessorDialog(QDialog):
         summary_group.setLayout(summary_layout)
         layout.addWidget(summary_group)
 
+        scroll_content = QWidget()
+        scroll_content.setLayout(layout)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(scroll_content)
+
+        outer_layout = QVBoxLayout()
+        outer_layout.addWidget(scroll_area)
+
         self.progress = QProgressBar()
         self.progress.setValue(0)
-        layout.addWidget(self.progress)
+        outer_layout.addWidget(self.progress)
         button_layout = QHBoxLayout()
         self.run_btn = QPushButton("Process")
         self.run_btn.clicked.connect(self.process)
@@ -387,15 +439,16 @@ class RasterProcessorDialog(QDialog):
         self.close_btn.clicked.connect(self.close)
         button_layout.addWidget(self.run_btn)
         button_layout.addWidget(self.close_btn)
-        layout.addLayout(button_layout)
+        outer_layout.addLayout(button_layout)
 
-        layout.addWidget(QLabel("Log:"))
+        outer_layout.addWidget(QLabel("Log:"))
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMinimumHeight(50)
-        layout.addWidget(self.log_text)
+        self.log_text.setMaximumHeight(140)
+        outer_layout.addWidget(self.log_text)
 
-        self.setLayout(layout)
+        self.setLayout(outer_layout)
 
         self.interpolate_radio.toggled.connect(self.toggle_mode)
         self.resample_radio.toggled.connect(self.toggle_mode)
@@ -408,7 +461,18 @@ class RasterProcessorDialog(QDialog):
         self.field_combo.currentIndexChanged.connect(self.update_summary)
         self.method_combo.currentIndexChanged.connect(self.update_method_help)
         self.method_combo.currentIndexChanged.connect(self.update_summary)
-        self.resolution_spin.valueChanged.connect(self.update_summary)
+        self.resolution_x_spin.valueChanged.connect(
+            lambda: self._sync_linked_resolution(self.resolution_x_spin, self.resolution_y_spin)
+        )
+        self.resolution_y_spin.valueChanged.connect(
+            lambda: self._sync_linked_resolution(self.resolution_y_spin, self.resolution_x_spin)
+        )
+        self.link_resolution_check.toggled.connect(
+            lambda: self._sync_linked_resolution(self.resolution_x_spin, self.resolution_y_spin)
+        )
+        self.resolution_x_spin.valueChanged.connect(self.update_summary)
+        self.resolution_y_spin.valueChanged.connect(self.update_summary)
+        self.link_resolution_check.toggled.connect(self.update_summary)
         self.grid_structure_combo.currentIndexChanged.connect(self.update_summary)
         self.regular_grid_method_combo.currentIndexChanged.connect(self.update_summary)
         self.extrap_check.toggled.connect(self.update_summary)
@@ -427,6 +491,10 @@ class RasterProcessorDialog(QDialog):
         self.smooth_raster_combo.currentIndexChanged.connect(self.update_summary)
         self.smooth_radius_spin.valueChanged.connect(self.update_summary)
         self.smooth_method_combo.currentIndexChanged.connect(self.update_summary)
+
+        self.parallel_check.toggled.connect(self.worker_count_spin.setEnabled)
+        self.parallel_check.toggled.connect(self.update_summary)
+        self.worker_count_spin.valueChanged.connect(self.update_summary)
 
     def log(self, message, level=Qgis.Info):
         message = str(message)
@@ -453,6 +521,15 @@ class RasterProcessorDialog(QDialog):
         self.xyz_clear_btn.setEnabled(not use_vector)
         self.xyz_crs_selector.setEnabled(not use_vector)
         self.update_summary()
+
+    def _sync_linked_resolution(self, source_spin, target_spin):
+        if not self.link_resolution_check.isChecked():
+            return
+        if abs(target_spin.value() - source_spin.value()) < 1e-9:
+            return
+        target_spin.blockSignals(True)
+        target_spin.setValue(source_spin.value())
+        target_spin.blockSignals(False)
 
     def update_method_help(self):
         method_key = self.method_combo.currentText().lower()
@@ -645,10 +722,13 @@ class RasterProcessorDialog(QDialog):
     def _normalized_source(self, source):
         return source.split("|", 1)[0] if source else source
 
-    def _open_raster_dataset(self, layer):
+    def _raster_source_path(self, layer):
         if not layer:
             raise ValueError("No raster layer selected.")
-        source = self._normalized_source(layer.dataProvider().dataSourceUri() or layer.source())
+        return self._normalized_source(layer.dataProvider().dataSourceUri() or layer.source())
+
+    def _open_raster_dataset(self, layer):
+        source = self._raster_source_path(layer)
         dataset = gdal.Open(source, gdal.GA_ReadOnly)
         if dataset is None:
             raise ValueError(f"Could not open raster source: {source}")
@@ -666,11 +746,11 @@ class RasterProcessorDialog(QDialog):
         ymin = ymax + dataset.RasterYSize * geotransform[5]
         return min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax)
 
-    def _estimate_output_grid(self, xmin, ymin, xmax, ymax, resolution):
+    def _estimate_output_grid(self, xmin, ymin, xmax, ymax, resolution_x, resolution_y):
         width = max(0.0, xmax - xmin)
         height = max(0.0, ymax - ymin)
-        cols = max(1, int(ceil(width / resolution)))
-        rows = max(1, int(ceil(height / resolution)))
+        cols = max(1, int(ceil(width / resolution_x)))
+        rows = max(1, int(ceil(height / resolution_y)))
         pixels = rows * cols
         return rows, cols, pixels
 
@@ -868,12 +948,12 @@ class RasterProcessorDialog(QDialog):
         x, y, z = self._aggregate_duplicate_points(x, y, z)
         return x, y, z, crs
 
-    def _grid_spec_from_points(self, x, y, resolution):
+    def _grid_spec_from_points(self, x, y, resolution_x, resolution_y):
         xmin = float(np.min(x))
         xmax = float(np.max(x))
         ymin = float(np.min(y))
         ymax = float(np.max(y))
-        rows, cols, pixels = self._estimate_output_grid(xmin, ymin, xmax, ymax, resolution)
+        rows, cols, pixels = self._estimate_output_grid(xmin, ymin, xmax, ymax, resolution_x, resolution_y)
         self._validate_output_pixels(rows, cols, "Interpolation")
         return {
             "xmin": xmin,
@@ -883,7 +963,8 @@ class RasterProcessorDialog(QDialog):
             "rows": rows,
             "cols": cols,
             "pixels": pixels,
-            "resolution": resolution,
+            "resolution_x": resolution_x,
+            "resolution_y": resolution_y,
         }
 
     def _create_output_dataset(self, output_file, cols, rows, band_count, projection_wkt):
@@ -950,9 +1031,10 @@ class RasterProcessorDialog(QDialog):
             f"completeness {grid_info['completeness'] * 100:.1f}%."
         )
 
-        target_resolution = self.resolution_spin.value()
-        same_x = abs(target_resolution - grid_info["x_res"]) <= 1e-6
-        same_y = abs(target_resolution - grid_info["y_res"]) <= 1e-6
+        target_resolution_x = self.resolution_x_spin.value()
+        target_resolution_y = self.resolution_y_spin.value()
+        same_x = abs(target_resolution_x - grid_info["x_res"]) <= 1e-6
+        same_y = abs(target_resolution_y - grid_info["y_res"]) <= 1e-6
 
         if same_x and same_y:
             out_dataset = gdal.GetDriverByName("GTiff").CreateCopy(
@@ -966,7 +1048,8 @@ class RasterProcessorDialog(QDialog):
                 native_bounds[1],
                 native_bounds[2],
                 native_bounds[3],
-                target_resolution,
+                target_resolution_x,
+                target_resolution_y,
             )
             self._validate_output_pixels(rows, cols, "Regular-grid export")
             out_dataset = gdal.Warp(
@@ -974,8 +1057,8 @@ class RasterProcessorDialog(QDialog):
                 native_dataset,
                 options=gdal.WarpOptions(
                     format="GTiff",
-                    xRes=target_resolution,
-                    yRes=target_resolution,
+                    xRes=target_resolution_x,
+                    yRes=target_resolution_y,
                     resampleAlg=self.regular_grid_method_combo.currentText().lower(),
                     srcNodata=DEFAULT_NODATA,
                     dstNodata=DEFAULT_NODATA,
@@ -995,6 +1078,45 @@ class RasterProcessorDialog(QDialog):
         return 1
 
     # -----------------------------
+    # Parallel processing
+    # -----------------------------
+    def _resolve_worker_python_executable(self):
+        exec_dir = os.path.dirname(sys.executable)
+        candidates = [
+            sys.executable if os.path.basename(sys.executable).lower().startswith("python") else None,
+            os.path.join(sys.exec_prefix, "python.exe"),
+            os.path.join(exec_dir, "python3.exe"),
+            os.path.join(exec_dir, "python.exe"),
+        ]
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _effective_worker_count(self, total_tiles):
+        if not self.parallel_check.isChecked() or total_tiles <= 1:
+            return 1
+        requested = max(1, min(self.worker_count_spin.value(), total_tiles))
+        if requested <= 1:
+            return 1
+        if os.name == "nt":
+            python_exe = self._resolve_worker_python_executable()
+            if not python_exe:
+                self.log(
+                    "Parallel processing needs a standalone Python interpreter, which could "
+                    "not be found next to this QGIS installation. Continuing with a single process.",
+                    Qgis.Warning,
+                )
+                return 1
+            multiprocessing.set_executable(python_exe)
+        return requested
+
+    def _performance_summary_line(self):
+        if self.parallel_check.isChecked():
+            return f"Parallel processing: enabled ({self.worker_count_spin.value()} worker processes)."
+        return "Parallel processing: disabled (single process)."
+
+    # -----------------------------
     # Summary
     # -----------------------------
     def update_summary(self):
@@ -1009,7 +1131,9 @@ class RasterProcessorDialog(QDialog):
         lines = []
         crs = self._selected_interpolation_crs()
         lines.append(f"CRS: {self._crs_label(crs)}")
-        lines.append(f"Resolution: {self.resolution_spin.value():.2f} m/pixel")
+        lines.append(
+            f"Grid cell size: {self.resolution_x_spin.value():.2f} x {self.resolution_y_spin.value():.2f} m"
+        )
         lines.append(f"Input structure: {self.grid_structure_combo.currentText()}")
         method_key = self.method_combo.currentText().lower()
         lines.append(f"Method: {self.method_combo.currentText()}")
@@ -1030,7 +1154,8 @@ class RasterProcessorDialog(QDialog):
                     extent.yMinimum(),
                     extent.xMaximum(),
                     extent.yMaximum(),
-                    self.resolution_spin.value(),
+                    self.resolution_x_spin.value(),
+                    self.resolution_y_spin.value(),
                 )
                 estimated_size = pixels * 4
                 lines.append(
@@ -1052,6 +1177,8 @@ class RasterProcessorDialog(QDialog):
                 f"Safety limit for {self.method_combo.currentText()}: "
                 f"{limit['max_points']:,} points and {limit['max_pixels']:,} pixels."
             )
+        if method_key in ("idw", "nearest"):
+            lines.append(self._performance_summary_line())
         return "\n".join(lines)
 
     def _resample_summary(self):
@@ -1071,6 +1198,7 @@ class RasterProcessorDialog(QDialog):
                 ymin,
                 xmax,
                 ymax,
+                self.resample_resolution_spin.value(),
                 self.resample_resolution_spin.value(),
             )
             self.resample_info_label.setText(
@@ -1115,6 +1243,7 @@ class RasterProcessorDialog(QDialog):
             )
             if layer.crs().isValid() and layer.crs().mapUnits() != QgsUnitTypes.DistanceMeters:
                 lines.append("Warning: the selected raster CRS is not metric.")
+            lines.append(self._performance_summary_line())
             dataset = None
         except Exception as exc:
             self.smooth_info_label.setText(str(exc))
@@ -1144,9 +1273,10 @@ class RasterProcessorDialog(QDialog):
     # Interpolation
     # -----------------------------
     def _process_interpolation(self, output_file):
-        resolution = self.resolution_spin.value()
-        if resolution <= 0:
-            raise ValueError("Resolution must be greater than zero.")
+        resolution_x = self.resolution_x_spin.value()
+        resolution_y = self.resolution_y_spin.value()
+        if resolution_x <= 0 or resolution_y <= 0:
+            raise ValueError("Grid cell size must be greater than zero.")
 
         self.log("Loading interpolation input points...")
         x, y, z, crs = self._collect_interpolation_points()
@@ -1168,10 +1298,10 @@ class RasterProcessorDialog(QDialog):
             self._add_output_to_project(output_file)
             return
 
-        grid_spec = self._grid_spec_from_points(x, y, resolution)
+        grid_spec = self._grid_spec_from_points(x, y, resolution_x, resolution_y)
         self.log(
             f"Interpolating {len(z):,} points to {grid_spec['cols']:,} x {grid_spec['rows']:,} pixels "
-            f"at {resolution:.2f} m/pixel."
+            f"with a {resolution_x:.2f} x {resolution_y:.2f} m grid cell size."
         )
 
         method = self.method_combo.currentText().lower()
@@ -1185,7 +1315,6 @@ class RasterProcessorDialog(QDialog):
     def _interpolate_idw_or_nearest(self, output_file, x, y, z, crs, grid_spec):
         method = self.method_combo.currentText().lower()
         points = np.column_stack((x, y))
-        tree = cKDTree(points)
         hull_equations = None if self.extrap_check.isChecked() else self._build_hull_equations(points)
 
         dataset = self._create_output_dataset(
@@ -1198,59 +1327,62 @@ class RasterProcessorDialog(QDialog):
         dataset.SetGeoTransform(
             (
                 grid_spec["xmin"],
-                grid_spec["resolution"],
+                grid_spec["resolution_x"],
                 0.0,
                 grid_spec["ymax"],
                 0.0,
-                -grid_spec["resolution"],
+                -grid_spec["resolution_y"],
             )
         )
         band = dataset.GetRasterBand(1)
         band.SetNoDataValue(DEFAULT_NODATA)
 
-        total_tiles = ceil(grid_spec["rows"] / DEFAULT_TILE_SIZE) * ceil(
-            grid_spec["cols"] / DEFAULT_TILE_SIZE
-        )
         power = self.idw_power_spin.value()
         neighbours = min(self.idw_neighbors_spin.value(), len(z))
+        tile_windows = list(self._tile_windows(grid_spec["rows"], grid_spec["cols"]))
+        total_tiles = len(tile_windows)
+        tasks = [
+            (
+                xoff, yoff, xsize, ysize,
+                grid_spec["xmin"], grid_spec["ymax"],
+                grid_spec["resolution_x"], grid_spec["resolution_y"],
+                method, power, neighbours, hull_equations, DEFAULT_NODATA,
+            )
+            for xoff, yoff, xsize, ysize in tile_windows
+        ]
 
-        for tile_index, (xoff, yoff, xsize, ysize) in enumerate(
-            self._tile_windows(grid_spec["rows"], grid_spec["cols"]),
-            start=1,
-        ):
-            x_coords = grid_spec["xmin"] + (np.arange(xsize) + xoff + 0.5) * grid_spec["resolution"]
-            y_coords = grid_spec["ymax"] - (np.arange(ysize) + yoff + 0.5) * grid_spec["resolution"]
-            tile_x, tile_y = np.meshgrid(x_coords, y_coords)
-            query_coords = np.column_stack((tile_x.ravel(), tile_y.ravel()))
-
-            if method == "nearest":
-                _, indices = tree.query(query_coords, k=1)
-                values = z[np.asarray(indices, dtype=np.int64)]
-            else:
-                distances, indices = tree.query(query_coords, k=neighbours)
-                if np.ndim(distances) == 1:
-                    distances = distances[:, None]
-                    indices = indices[:, None]
-
-                distances = np.asarray(distances, dtype=np.float64)
-                indices = np.asarray(indices, dtype=np.int64)
-                exact_matches = distances[:, 0] <= 1e-12
-                safe_distances = np.maximum(distances, 1e-12)
-                weights = 1.0 / np.power(safe_distances, power)
-                values = np.sum(weights * z[indices], axis=1) / np.sum(weights, axis=1)
-                if np.any(exact_matches):
-                    values[exact_matches] = z[indices[exact_matches, 0]]
-
-            if hull_equations is not None:
-                inside_mask = self._points_inside_hull(query_coords, hull_equations)
-                values[~inside_mask] = DEFAULT_NODATA
-
-            tile_array = values.reshape((ysize, xsize)).astype(np.float32)
-            band.WriteArray(tile_array, xoff, yoff)
-            self._set_progress((tile_index / total_tiles) * 100)
+        worker_count = self._effective_worker_count(total_tiles)
+        if worker_count > 1:
+            try:
+                self._run_idw_tiles_parallel(tasks, x, y, z, worker_count, band, total_tiles)
+            except Exception as exc:
+                self.log(f"Parallel interpolation failed ({exc}); retrying with a single process.", Qgis.Warning)
+                parallel_workers.init_idw_worker(x, y, z)
+                self._run_idw_tiles_sequential(tasks, band, total_tiles)
+        else:
+            parallel_workers.init_idw_worker(x, y, z)
+            self._run_idw_tiles_sequential(tasks, band, total_tiles)
 
         dataset.FlushCache()
         dataset = None
+
+    def _run_idw_tiles_sequential(self, tasks, band, total_tiles):
+        for tile_index, task in enumerate(tasks, start=1):
+            xoff, yoff, tile_array = parallel_workers.idw_or_nearest_tile(task)
+            band.WriteArray(tile_array, xoff, yoff)
+            self._set_progress((tile_index / total_tiles) * 100)
+
+    def _run_idw_tiles_parallel(self, tasks, x, y, z, worker_count, band, total_tiles):
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=parallel_workers.init_idw_worker,
+            initargs=(x, y, z),
+        ) as executor:
+            for tile_index, (xoff, yoff, tile_array) in enumerate(
+                executor.map(parallel_workers.idw_or_nearest_tile, tasks), start=1
+            ):
+                band.WriteArray(tile_array, xoff, yoff)
+                self._set_progress((tile_index / total_tiles) * 100)
 
     def _interpolate_advanced_method(self, output_file, x, y, z, crs, grid_spec):
         method = self.method_combo.currentText().lower()
@@ -1269,8 +1401,8 @@ class RasterProcessorDialog(QDialog):
         points = np.column_stack((x, y))
         hull_equations = None if self.extrap_check.isChecked() else self._build_hull_equations(points)
 
-        grid_x = grid_spec["xmin"] + (np.arange(grid_spec["cols"]) + 0.5) * grid_spec["resolution"]
-        grid_y = grid_spec["ymax"] - (np.arange(grid_spec["rows"]) + 0.5) * grid_spec["resolution"]
+        grid_x = grid_spec["xmin"] + (np.arange(grid_spec["cols"]) + 0.5) * grid_spec["resolution_x"]
+        grid_y = grid_spec["ymax"] - (np.arange(grid_spec["rows"]) + 0.5) * grid_spec["resolution_y"]
         mesh_x, mesh_y = np.meshgrid(grid_x, grid_y)
         query_coords = np.column_stack((mesh_x.ravel(), mesh_y.ravel()))
 
@@ -1298,11 +1430,11 @@ class RasterProcessorDialog(QDialog):
         dataset.SetGeoTransform(
             (
                 grid_spec["xmin"],
-                grid_spec["resolution"],
+                grid_spec["resolution_x"],
                 0.0,
                 grid_spec["ymax"],
                 0.0,
-                -grid_spec["resolution"],
+                -grid_spec["resolution_y"],
             )
         )
         band = dataset.GetRasterBand(1)
@@ -1326,7 +1458,7 @@ class RasterProcessorDialog(QDialog):
 
         dataset = self._open_raster_dataset(layer)
         xmin, ymin, xmax, ymax = self._dataset_bounds(dataset)
-        rows, cols, _ = self._estimate_output_grid(xmin, ymin, xmax, ymax, target_resolution)
+        rows, cols, _ = self._estimate_output_grid(xmin, ymin, xmax, ymax, target_resolution, target_resolution)
         self._validate_output_pixels(rows, cols, "Resampling")
 
         first_band = dataset.GetRasterBand(1)
@@ -1365,6 +1497,7 @@ class RasterProcessorDialog(QDialog):
             raise ValueError("Please select a raster layer.")
         self._validate_metric_crs(layer.crs(), "Raster layer")
 
+        source_path = self._raster_source_path(layer)
         dataset = self._open_raster_dataset(layer)
         radius_m = self.smooth_radius_spin.value()
         if radius_m <= 0:
@@ -1375,6 +1508,8 @@ class RasterProcessorDialog(QDialog):
             raise ValueError("Raster pixel size is invalid.")
 
         method_key = self.smooth_method_combo.currentText().lower()
+        sigma_x = sigma_y = 0.0
+        size_x = size_y = 0
         if method_key == "gaussian":
             sigma_x = max(radius_m / pixel_x, 0.01)
             sigma_y = max(radius_m / pixel_y, 0.01)
@@ -1397,10 +1532,8 @@ class RasterProcessorDialog(QDialog):
         )
         output_dataset.SetGeoTransform(dataset.GetGeoTransform())
 
-        total_tiles = ceil(dataset.RasterYSize / DEFAULT_TILE_SIZE) * ceil(
-            dataset.RasterXSize / DEFAULT_TILE_SIZE
-        )
-        total_steps = max(1, dataset.RasterCount * total_tiles)
+        tile_windows = list(self._tile_windows(dataset.RasterYSize, dataset.RasterXSize))
+        total_steps = max(1, dataset.RasterCount * len(tile_windows))
         step_index = 0
 
         self.log(
@@ -1414,68 +1547,53 @@ class RasterProcessorDialog(QDialog):
             target_nodata = source_nodata if source_nodata is not None else DEFAULT_NODATA
             output_band.SetNoDataValue(target_nodata)
 
-            for xoff, yoff, xsize, ysize in self._tile_windows(
-                dataset.RasterYSize,
-                dataset.RasterXSize,
-            ):
-                read_xoff = max(0, xoff - halo_x)
-                read_yoff = max(0, yoff - halo_y)
-                read_xend = min(dataset.RasterXSize, xoff + xsize + halo_x)
-                read_yend = min(dataset.RasterYSize, yoff + ysize + halo_y)
-                read_xsize = read_xend - read_xoff
-                read_ysize = read_yend - read_yoff
-
-                array = input_band.ReadAsArray(read_xoff, read_yoff, read_xsize, read_ysize)
-                array = np.asarray(array, dtype=np.float64)
-
-                valid_mask = np.isfinite(array)
-                if source_nodata is not None:
-                    valid_mask &= ~np.isclose(array, source_nodata)
-
-                value_array = np.where(valid_mask, array, 0.0)
-                weight_array = valid_mask.astype(np.float64)
-
-                if method_key == "gaussian":
-                    filtered_values = gaussian_filter(
-                        value_array,
-                        sigma=(sigma_y, sigma_x),
-                        mode="nearest",
-                    )
-                    filtered_weights = gaussian_filter(
-                        weight_array,
-                        sigma=(sigma_y, sigma_x),
-                        mode="nearest",
-                    )
-                else:
-                    filtered_values = uniform_filter(
-                        value_array,
-                        size=(size_y, size_x),
-                        mode="nearest",
-                    )
-                    filtered_weights = uniform_filter(
-                        weight_array,
-                        size=(size_y, size_x),
-                        mode="nearest",
-                    )
-
-                smoothed = np.full_like(filtered_values, target_nodata, dtype=np.float64)
-                nonzero_weights = filtered_weights > 1e-12
-                smoothed[nonzero_weights] = (
-                    filtered_values[nonzero_weights] / filtered_weights[nonzero_weights]
+            tasks = [
+                (
+                    xoff, yoff, xsize, ysize, halo_x, halo_y,
+                    dataset.RasterXSize, dataset.RasterYSize,
+                    method_key, sigma_x, sigma_y, size_x, size_y,
+                    source_nodata, target_nodata,
                 )
+                for xoff, yoff, xsize, ysize in tile_windows
+            ]
 
-                inner_xoff = xoff - read_xoff
-                inner_yoff = yoff - read_yoff
-                inner = smoothed[
-                    inner_yoff : inner_yoff + ysize,
-                    inner_xoff : inner_xoff + xsize,
-                ].astype(np.float32)
-                output_band.WriteArray(inner, xoff, yoff)
-
-                step_index += 1
-                self._set_progress((step_index / total_steps) * 100)
+            worker_count = self._effective_worker_count(len(tile_windows))
+            if worker_count > 1:
+                try:
+                    step_index = self._run_smooth_tiles_parallel(
+                        tasks, source_path, band_number, worker_count, output_band, step_index, total_steps
+                    )
+                except Exception as exc:
+                    self.log(f"Parallel smoothing failed ({exc}); retrying this band with a single process.", Qgis.Warning)
+                    parallel_workers.init_smooth_worker(source_path, band_number)
+                    step_index = self._run_smooth_tiles_sequential(tasks, output_band, step_index, total_steps)
+            else:
+                parallel_workers.init_smooth_worker(source_path, band_number)
+                step_index = self._run_smooth_tiles_sequential(tasks, output_band, step_index, total_steps)
 
         output_dataset.FlushCache()
         output_dataset = None
         dataset = None
         self._add_output_to_project(output_file)
+
+    def _run_smooth_tiles_sequential(self, tasks, output_band, step_offset, total_steps):
+        for task in tasks:
+            xoff, yoff, inner = parallel_workers.smooth_tile(task)
+            output_band.WriteArray(inner, xoff, yoff)
+            step_offset += 1
+            self._set_progress((step_offset / total_steps) * 100)
+        return step_offset
+
+    def _run_smooth_tiles_parallel(
+        self, tasks, source_path, band_number, worker_count, output_band, step_offset, total_steps
+    ):
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=parallel_workers.init_smooth_worker,
+            initargs=(source_path, band_number),
+        ) as executor:
+            for xoff, yoff, inner in executor.map(parallel_workers.smooth_tile, tasks):
+                output_band.WriteArray(inner, xoff, yoff)
+                step_offset += 1
+                self._set_progress((step_offset / total_steps) * 100)
+        return step_offset
